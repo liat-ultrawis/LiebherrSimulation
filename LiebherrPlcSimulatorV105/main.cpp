@@ -1,11 +1,11 @@
-
 // Liebherr PLC Simulator V1.05
-// Minimal standalone Windows console app that acts as the PLC (master).
+// Single-threaded precise timing: one TX every 50 ms, one RX attempt per cycle using overlapped I/O.
 // - Reads COM port from config.ini (COM_PORT=COMx)
-// - Opens serial at 19200 8E1
-// - Sends a valid V1.05 PLC->ACS packet (28 bytes) every 20 ms
-// - Waits up to 30 ms for a valid V1.05 ACS->PLC packet (8 bytes)
-// - Prints TX/RX/error lines (now with timestamp)
+// - Opens serial at 19200 8E1 (unchanged)
+// - Sends one valid 28-byte PLC->ACS frame exactly on steady_clock deadlines 50 ms apart
+// - Immediately starts ONE overlapped ReadFile and waits until either it completes or the next deadline occurs
+// - If ReadFile completes before the deadline print RX once; otherwise cancel the pending read and send next TX
+// - No per-cycle COMMTIMEOUTS changes, no additional threads, no RX validation/interpretation
 //
 // Protocol reference: protocol1.05-spec.md
 
@@ -18,13 +18,17 @@
 #include <string>
 #include <fstream>
 #include <vector>
+#include <chrono>
+#include <thread>
+
+using steady_clock = std::chrono::steady_clock;
+using ms = std::chrono::milliseconds;
 
 // ---------------- Config ----------------
 static std::string readComPortFromIni(const std::string& path) {
     std::ifstream f(path);
     std::string line;
     while (std::getline(f, line)) {
-        // strip CR
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
             line.pop_back();
         if (line.empty() || line[0] == ';' || line[0] == '#') continue;
@@ -32,7 +36,6 @@ static std::string readComPortFromIni(const std::string& path) {
         if (eq == std::string::npos) continue;
         std::string k = line.substr(0, eq);
         std::string v = line.substr(eq + 1);
-        // trim
         auto trim = [](std::string& s) {
             size_t a = s.find_first_not_of(" \t");
             size_t b = s.find_last_not_of(" \t");
@@ -45,17 +48,22 @@ static std::string readComPortFromIni(const std::string& path) {
     return "COM5";
 }
 
-// ---------------- Serial ----------------
+// ---------------- Serial (overlapped support) ----------------
 class SerialPort {
 public:
     SerialPort() : h_(INVALID_HANDLE_VALUE) {}
     ~SerialPort() { close(); }
 
     bool open(const std::string& port) {
-        // Use \\.\COMx form to support COM10+
+        // Use \\.\COMx form and open overlapped
         std::string devName = "\\\\.\\" + port;
-        h_ = CreateFileA(devName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-            OPEN_EXISTING, 0, nullptr);
+        h_ = CreateFileA(devName.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+            nullptr);
         if (h_ == INVALID_HANDLE_VALUE) return false;
 
         DCB dcb{};
@@ -74,9 +82,10 @@ public:
         dcb.fOutX = FALSE; dcb.fInX = FALSE;
         if (!SetCommState(h_, &dcb)) return false;
 
+        // Set initial COM timeouts (not changed per-cycle). Overlapped reads will be managed by the loop.
         COMMTIMEOUTS to{};
         to.ReadIntervalTimeout = MAXDWORD;
-        to.ReadTotalTimeoutConstant = 30;   // 30 ms receive window
+        to.ReadTotalTimeoutConstant = 30;
         to.ReadTotalTimeoutMultiplier = 0;
         to.WriteTotalTimeoutConstant = 50;
         to.WriteTotalTimeoutMultiplier = 0;
@@ -90,18 +99,85 @@ public:
         if (h_ != INVALID_HANDLE_VALUE) { CloseHandle(h_); h_ = INVALID_HANDLE_VALUE; }
     }
 
-    bool write(const uint8_t* data, size_t n) {
+    // synchronous write implemented on an overlapped handle (blocks until complete)
+    bool writeSync(const uint8_t* data, size_t n) {
+        if (h_ == INVALID_HANDLE_VALUE) return false;
+        OVERLAPPED ov;
+        ZeroMemory(&ov, sizeof(ov));
+        ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent) return false;
+
         DWORD written = 0;
-        if (!WriteFile(h_, data, (DWORD)n, &written, nullptr)) return false;
+        BOOL ok = WriteFile(h_, data, (DWORD)n, &written, &ov);
+        if (!ok) {
+            DWORD e = GetLastError();
+            if (e == ERROR_IO_PENDING) {
+                if (!GetOverlappedResult(h_, &ov, &written, TRUE)) {
+                    CloseHandle(ov.hEvent);
+                    return false;
+                }
+            }
+            else {
+                CloseHandle(ov.hEvent);
+                return false;
+            }
+        }
+        CloseHandle(ov.hEvent);
         return written == n;
     }
 
-    // Read up to n bytes, blocks up to the configured timeout total.
-    // Returns number of bytes actually read.
-    int read(uint8_t* buf, size_t n) {
-        DWORD got = 0;
-        if (!ReadFile(h_, buf, (DWORD)n, &got, nullptr)) return -1;
-        return (int)got;
+    // Start one overlapped read and wait up to timeoutMs for completion.
+    // Returns: >0 number of bytes read, 0 = timeout (no bytes), -1 = error.
+    int readOnceUntil(uint8_t* buf, size_t bufSize, unsigned timeoutMs) {
+        if (h_ == INVALID_HANDLE_VALUE) return -1;
+        OVERLAPPED ov;
+        ZeroMemory(&ov, sizeof(ov));
+        ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent) return -1;
+
+        DWORD bytesRead = 0;
+        BOOL ok = ReadFile(h_, buf, (DWORD)bufSize, &bytesRead, &ov);
+        if (ok) {
+            // completed immediately
+            CloseHandle(ov.hEvent);
+            return (int)bytesRead;
+        }
+
+        DWORD err = GetLastError();
+        if (err != ERROR_IO_PENDING) {
+            CloseHandle(ov.hEvent);
+            return -1;
+        }
+
+        // wait for either completion or timeoutMs
+        DWORD waitRes = WaitForSingleObject(ov.hEvent, timeoutMs);
+        if (waitRes == WAIT_OBJECT_0) {
+            DWORD got = 0;
+            if (!GetOverlappedResult(h_, &ov, &got, TRUE)) {
+                CloseHandle(ov.hEvent);
+                return -1;
+            }
+            CloseHandle(ov.hEvent);
+            return (int)got;
+        }
+        else if (waitRes == WAIT_TIMEOUT) {
+            // cancel the pending read; do not block waiting for cancel to complete
+            CancelIoEx(h_, &ov);
+            // try to obtain any completed bytes without waiting
+            DWORD got = 0;
+            if (GetOverlappedResult(h_, &ov, &got, FALSE)) {
+                CloseHandle(ov.hEvent);
+                return (int)got;
+            }
+            CloseHandle(ov.hEvent);
+            return 0; // timed out before any bytes
+        }
+        else {
+            // wait error
+            CancelIoEx(h_, &ov);
+            CloseHandle(ov.hEvent);
+            return -1;
+        }
     }
 
     bool valid() const { return h_ != INVALID_HANDLE_VALUE; }
@@ -110,138 +186,98 @@ private:
     HANDLE h_;
 };
 
-// ---------------- V1.05 protocol ----------------
-// PLC -> ACS: 28 bytes total.
-//   [0]  STX = 0xC0
-//   [1..25] payload bytes (bit7 always 0)
-//   [26] XOR of [1..25], bit7 = 0
-//   [27] ETX = 0x80
+// ---------------- V1.05 protocol (TX unchanged) ----------------
 static void buildPlcPacket(uint8_t out[28], uint32_t counter) {
     std::memset(out, 0, 28);
     out[0] = 0xC0; // STX
-
-    // Everything zero by default satisfies "bit7 == 0" and represents a
-    // safe/idle PLC state (no drives commanded, sensors at 0).
-    // We toggle a heartbeat bit in "position data valid" (Byte4 / bit5)
-    // so the ACS side sees the packet contents move.
-    out[4] = (uint8_t)(1u << 5); // 2.Res / bit5 = position data valid
-
-    // Optional: put a slowly moving counter into the free "Value 08"
-    // bytes 21 and 22 so raw traffic isn't visually static. Keep bit7 = 0.
+    out[4] = (uint8_t)(1u << 5); // position data valid
     out[21] = (uint8_t)(counter & 0x7F);
     out[22] = (uint8_t)((counter >> 7) & 0x7F);
-
-    // XOR checksum over bytes [1..25], mask bit7 to 0.
     uint8_t xr = 0;
     for (int i = 1; i <= 25; ++i) xr ^= out[i];
     out[26] = (uint8_t)(xr & 0x7F);
-
     out[27] = 0x80; // ETX
 }
 
-// Validate 8-byte ACS -> PLC packet (kept but not used when printing raw).
-static bool validateAcsPacket(const uint8_t* p, size_t n, std::string& err) {
-    if (n != 8) { err = "wrong length"; return false; }
-    if (p[0] != 0xC0) { err = "missing STX";  return false; }
-    if (p[7] != 0x80) { err = "missing ETX";  return false; }
-    for (int i = 1; i <= 6; ++i)
-        if (p[i] & 0x80) { err = "bit7 set in data byte"; return false; }
-    uint8_t xr = 0;
-    for (int i = 1; i <= 5; ++i) xr ^= p[i];
-    xr &= 0x7F;
-    if (xr != p[6]) { err = "bad checksum"; return false; }
-    return true;
+// ---------------- Timestamp helper (monotonic, ms precision) ----------------
+static steady_clock::time_point g_start_time;
+static void formatElapsed(char* buf, size_t buflen, steady_clock::time_point tp) {
+    using namespace std::chrono;
+    auto elapsed = duration_cast<std::chrono::milliseconds>(tp - g_start_time).count();
+    long long seconds = elapsed / 1000;
+    int ms_part = (int)(elapsed % 1000);
+    _snprintf_s(buf, buflen, _TRUNCATE, "%lld.%03d", seconds, ms_part);
 }
 
-// ---------------- Printing with timestamp ----------------
-static void currentTimestamp(char* buf, size_t buflen) {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    // Format: HH:MM:SS.mmm
-    _snprintf_s(buf, buflen, _TRUNCATE, "%02d:%02d:%02d.%03d",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-}
-
-static void printBytes(const char* tag, const uint8_t* p, size_t n) {
-    char ts[32];
-    currentTimestamp(ts, sizeof(ts));
-    std::printf("[%s] %s:", ts, tag);
+// ---------------- Printing (TX/RX only) ----------------
+static void printHexLine(const char* dir, steady_clock::time_point ts, const uint8_t* p, size_t n) {
+    char tbuf[32];
+    formatElapsed(tbuf, sizeof(tbuf), ts);
+    std::printf("%s [%s]", dir, tbuf);
     for (size_t i = 0; i < n; ++i) std::printf(" %02X", p[i]);
     std::printf("\n");
     std::fflush(stdout);
 }
 
-// Read exactly one V1.05 ACS frame within the receive window (30 ms).
-// Framing strategy: scan the incoming byte stream for 0xC0, then read
-// 7 more bytes; validate ETX at the end. Because SetCommTimeouts uses a
-// 30 ms total-read timeout, this whole routine cannot exceed ~30 ms.
-static int receiveAcsFrame(SerialPort& sp, uint8_t out[8]) {
-    uint8_t scratch[64];
-    int got = sp.read(scratch, sizeof(scratch));
-    if (got <= 0) return got; // 0 = timeout, -1 = error
-    // Find 0xC0
-    for (int i = 0; i < got; ++i) {
-        if (scratch[i] == 0xC0) {
-            int remaining = got - i;
-            if (remaining >= 8) {
-                std::memcpy(out, scratch + i, 8);
-                return 8;
-            }
-            // We have STX but not the full frame yet; read the rest.
-            std::memcpy(out, scratch + i, remaining);
-            int need = 8 - remaining;
-            int more = sp.read(out + remaining, need);
-            if (more < 0) return -1;
-            return remaining + more;
-        }
-    }
-    return 0; // no STX found
-}
-
+// ---------------- main (single-threaded periodic loop with overlapped RX) ----------------
 int main() {
     std::string comPort = readComPortFromIni("config.ini");
     std::printf("Liebherr PLC Simulator V1.05\n");
     std::printf("Using %s at 19200 8E1\n", comPort.c_str());
+    std::fflush(stdout);
 
     SerialPort sp;
     if (!sp.open(comPort)) {
-        std::printf("ERROR: failed to open %s (GetLastError=%lu)\n",
-            comPort.c_str(), GetLastError());
+        std::printf("ERROR: failed to open %s (GetLastError=%lu)\n", comPort.c_str(), GetLastError());
         return 1;
     }
 
+    // start monotonic reference
+    g_start_time = steady_clock::now();
+
+    const ms period(50);
+    auto next_tx = steady_clock::now(); // first signal at now
     uint32_t counter = 0;
+
     for (;;) {
-        // ---- TX ----
+        // wait until the scheduled absolute TX deadline
+        std::this_thread::sleep_until(next_tx);
+
+        // 1) Send exactly one PLC frame and timestamp send-start
         uint8_t tx[28];
         buildPlcPacket(tx, counter++);
-        if (!sp.write(tx, sizeof(tx))) {
+        auto tx_ts = steady_clock::now();
+
+        if (!sp.writeSync(tx, sizeof(tx))) {
             std::printf("ERROR: serial write failed (GetLastError=%lu)\n", GetLastError());
             break;
         }
-        printBytes("TX", tx, sizeof(tx));
 
-        // ---- RX (up to ~30 ms) ----
-        uint8_t rx[8] = { 0 };
-        int n = receiveAcsFrame(sp, rx);
-        if (n < 0) {
-            std::printf("ERROR: serial read failed (GetLastError=%lu)\n", GetLastError());
-            break;
-        }
-        else if (n == 0) {
-            // no response this window; remain silent or show a small info:
-            char ts[32]; currentTimestamp(ts, sizeof(ts));
-            std::printf("[%s] RX: (no response within 30 ms)\n", ts);
-            std::fflush(stdout);
-        }
-        else {
-            printBytes("RX", rx, (size_t)n);
-            // validation intentionally omitted for now
-        }
-        std::fflush(stdout);
+        // 2) Print TX line
+        printHexLine("TX", tx_ts, tx, sizeof(tx));
 
-        // ---- Send cycle = 20 ms ----
-        Sleep(20);
+        // 3) Listen for ONE RX response only, up to the remaining time before next deadline
+        auto deadline = next_tx + period;
+        auto now_after_tx = steady_clock::now();
+        auto remain_ms_ll = std::chrono::duration_cast<ms>(deadline - now_after_tx).count();
+        if (remain_ms_ll > 0) {
+            unsigned remain_ms = (unsigned)remain_ms_ll;
+            uint8_t rxbuf[256];
+            int r = sp.readOnceUntil(rxbuf, sizeof(rxbuf), remain_ms);
+            if (r < 0) {
+                std::printf("ERROR: serial read failed (GetLastError=%lu)\n", GetLastError());
+                break;
+            }
+            else if (r > 0) {
+                auto rx_ts = steady_clock::now();
+                printHexLine("RX", rx_ts, rxbuf, (size_t)r);
+                // STOP listening for further RX this cycle; we did exactly one read
+            }
+            // r == 0 => timed out before deadline, print nothing
+        }
+        // 5) Advance to next absolute deadline (no catch-up bursts)
+        next_tx += period;
+        // loop repeats; sleep_until(next_tx) at top ensures absolute periodic schedule
     }
 
     sp.close();
