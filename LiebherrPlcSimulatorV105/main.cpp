@@ -1,10 +1,11 @@
+
 // Liebherr PLC Simulator V1.05
 // Minimal standalone Windows console app that acts as the PLC (master).
 // - Reads COM port from config.ini (COM_PORT=COMx)
 // - Opens serial at 19200 8E1
 // - Sends a valid V1.05 PLC->ACS packet (28 bytes) every 20 ms
 // - Waits up to 30 ms for a valid V1.05 ACS->PLC packet (8 bytes)
-// - Prints TX/RX/error lines
+// - Prints TX/RX/error lines (now with timestamp)
 //
 // Protocol reference: protocol1.05-spec.md
 
@@ -32,12 +33,12 @@ static std::string readComPortFromIni(const std::string& path) {
         std::string k = line.substr(0, eq);
         std::string v = line.substr(eq + 1);
         // trim
-        auto trim = [](std::string& s){
+        auto trim = [](std::string& s) {
             size_t a = s.find_first_not_of(" \t");
             size_t b = s.find_last_not_of(" \t");
             if (a == std::string::npos) { s.clear(); return; }
             s = s.substr(a, b - a + 1);
-        };
+            };
         trim(k); trim(v);
         if (k == "COM_PORT") return v;
     }
@@ -54,7 +55,7 @@ public:
         // Use \\.\COMx form to support COM10+
         std::string devName = "\\\\.\\" + port;
         h_ = CreateFileA(devName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                         OPEN_EXISTING, 0, nullptr);
+            OPEN_EXISTING, 0, nullptr);
         if (h_ == INVALID_HANDLE_VALUE) return false;
 
         DCB dcb{};
@@ -62,22 +63,22 @@ public:
         if (!GetCommState(h_, &dcb)) return false;
         dcb.BaudRate = 19200;
         dcb.ByteSize = 8;
-        dcb.Parity   = EVENPARITY;
+        dcb.Parity = EVENPARITY;
         dcb.StopBits = ONESTOPBIT;
-        dcb.fBinary  = TRUE;
-        dcb.fParity  = TRUE;
+        dcb.fBinary = TRUE;
+        dcb.fParity = TRUE;
         dcb.fOutxCtsFlow = FALSE;
         dcb.fOutxDsrFlow = FALSE;
-        dcb.fDtrControl  = DTR_CONTROL_DISABLE;
-        dcb.fRtsControl  = RTS_CONTROL_DISABLE;
+        dcb.fDtrControl = DTR_CONTROL_DISABLE;
+        dcb.fRtsControl = RTS_CONTROL_DISABLE;
         dcb.fOutX = FALSE; dcb.fInX = FALSE;
         if (!SetCommState(h_, &dcb)) return false;
 
         COMMTIMEOUTS to{};
-        to.ReadIntervalTimeout         = MAXDWORD;
-        to.ReadTotalTimeoutConstant    = 30;   // 30 ms receive window
-        to.ReadTotalTimeoutMultiplier  = 0;
-        to.WriteTotalTimeoutConstant   = 50;
+        to.ReadIntervalTimeout = MAXDWORD;
+        to.ReadTotalTimeoutConstant = 30;   // 30 ms receive window
+        to.ReadTotalTimeoutMultiplier = 0;
+        to.WriteTotalTimeoutConstant = 50;
         to.WriteTotalTimeoutMultiplier = 0;
         if (!SetCommTimeouts(h_, &to)) return false;
 
@@ -138,23 +139,33 @@ static void buildPlcPacket(uint8_t out[28], uint32_t counter) {
     out[27] = 0x80; // ETX
 }
 
-// Validate 8-byte ACS -> PLC packet.
+// Validate 8-byte ACS -> PLC packet (kept but not used when printing raw).
 static bool validateAcsPacket(const uint8_t* p, size_t n, std::string& err) {
-    if (n != 8)          { err = "wrong length"; return false; }
-    if (p[0] != 0xC0)    { err = "missing STX";  return false; }
-    if (p[7] != 0x80)    { err = "missing ETX";  return false; }
+    if (n != 8) { err = "wrong length"; return false; }
+    if (p[0] != 0xC0) { err = "missing STX";  return false; }
+    if (p[7] != 0x80) { err = "missing ETX";  return false; }
     for (int i = 1; i <= 6; ++i)
         if (p[i] & 0x80) { err = "bit7 set in data byte"; return false; }
     uint8_t xr = 0;
     for (int i = 1; i <= 5; ++i) xr ^= p[i];
     xr &= 0x7F;
-    if (xr != p[6])      { err = "bad checksum"; return false; }
+    if (xr != p[6]) { err = "bad checksum"; return false; }
     return true;
 }
 
-// ---------------- Printing ----------------
+// ---------------- Printing with timestamp ----------------
+static void currentTimestamp(char* buf, size_t buflen) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    // Format: HH:MM:SS.mmm
+    _snprintf_s(buf, buflen, _TRUNCATE, "%02d:%02d:%02d.%03d",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+}
+
 static void printBytes(const char* tag, const uint8_t* p, size_t n) {
-    std::printf("%s:", tag);
+    char ts[32];
+    currentTimestamp(ts, sizeof(ts));
+    std::printf("[%s] %s:", ts, tag);
     for (size_t i = 0; i < n; ++i) std::printf(" %02X", p[i]);
     std::printf("\n");
     std::fflush(stdout);
@@ -195,7 +206,7 @@ int main() {
     SerialPort sp;
     if (!sp.open(comPort)) {
         std::printf("ERROR: failed to open %s (GetLastError=%lu)\n",
-                    comPort.c_str(), GetLastError());
+            comPort.c_str(), GetLastError());
         return 1;
     }
 
@@ -211,21 +222,25 @@ int main() {
         printBytes("TX", tx, sizeof(tx));
 
         // ---- RX (up to ~30 ms) ----
-        uint8_t rx[8] = {0};
+        uint8_t rx[8] = { 0 };
         int n = receiveAcsFrame(sp, rx);
-        if (n <= 0) {
-            std::printf("ERROR: serial read failed (GetLastError=%lu) or RX timeout (no ACS response within 30 ms)\n", GetLastError());
-        } else {
+        if (n < 0) {
+            std::printf("ERROR: serial read failed (GetLastError=%lu)\n", GetLastError());
+            break;
+        }
+        else if (n == 0) {
+            // no response this window; remain silent or show a small info:
+            char ts[32]; currentTimestamp(ts, sizeof(ts));
+            std::printf("[%s] RX: (no response within 30 ms)\n", ts);
+            std::fflush(stdout);
+        }
+        else {
             printBytes("RX", rx, (size_t)n);
-            std::string err;
-           // if (!validateAcsPacket(rx, (size_t)n, err)) {
-            //    std::printf("ERROR: invalid ACS packet: %s\n", err.c_str());
-           // }
+            // validation intentionally omitted for now
         }
         std::fflush(stdout);
 
-        // ---- Send cycle = 20 ms (RX already consumed up to 30 ms window,
-        //      so we simply wait 20 ms before the next TX) ----
+        // ---- Send cycle = 20 ms ----
         Sleep(20);
     }
 
