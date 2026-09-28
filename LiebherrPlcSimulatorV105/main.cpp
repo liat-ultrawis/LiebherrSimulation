@@ -128,6 +128,14 @@ public:
 
     // Start one overlapped read and wait up to timeoutMs for completion.
     // Returns: >0 number of bytes read, 0 = timeout (no bytes), -1 = error.
+    // Behavior notes (implements safe cancellation + stale-RX discard):
+    //  - If read completes before timeout -> return bytes (>0).
+    //  - If timeout occurs:
+    //      - CancelIoEx is called.
+    //      - Wait for the overlapped operation to complete/cancel before closing event/returning.
+    //      - Any bytes that completed after the deadline are discarded (PurgeComm RX) to avoid them being reported in the next cycle.
+    //      - ERROR_OPERATION_ABORTED originating from our CancelIoEx is treated as normal timeout (return 0).
+    //      - Any other error is reported as -1.
     int readOnceUntil(uint8_t* buf, size_t bufSize, unsigned timeoutMs) {
         if (h_ == INVALID_HANDLE_VALUE) return -1;
         OVERLAPPED ov;
@@ -152,32 +160,69 @@ public:
         // wait for either completion or timeoutMs
         DWORD waitRes = WaitForSingleObject(ov.hEvent, timeoutMs);
         if (waitRes == WAIT_OBJECT_0) {
+            // Read completed before deadline.
             DWORD got = 0;
-            if (!GetOverlappedResult(h_, &ov, &got, TRUE)) {
+            if (!GetOverlappedResult(h_, &ov, &got, FALSE)) {
+                DWORD gle = GetLastError();
                 CloseHandle(ov.hEvent);
+                // If operation was aborted unexpectedly, treat as error unless it's our cancellation (should not happen here).
+                if (gle == ERROR_OPERATION_ABORTED) return 0;
                 return -1;
             }
             CloseHandle(ov.hEvent);
             return (int)got;
         }
         else if (waitRes == WAIT_TIMEOUT) {
-            // cancel the pending read; do not block waiting for cancel to complete
+            // Deadline reached: cancel the pending read, then wait for completion/cancellation
             CancelIoEx(h_, &ov);
-            // try to obtain any completed bytes without waiting
-            DWORD got = 0;
-            if (GetOverlappedResult(h_, &ov, &got, FALSE)) {
+
+            // WAIT: ensure completion/cancellation finishes before we destroy ov/event/buf.
+            // Safety priority: wait indefinitely to let cancellation complete. This may delay the next TX if system is slow,
+            // but avoids unsafe destruction of overlapped/event while driver still references them.
+            DWORD waitRes2 = WaitForSingleObject(ov.hEvent, INFINITE);
+            if (waitRes2 == WAIT_OBJECT_0) {
+                // get final result without blocking
+                DWORD got = 0;
+                if (!GetOverlappedResult(h_, &ov, &got, FALSE)) {
+                    DWORD gle = GetLastError();
+                    CloseHandle(ov.hEvent);
+                    // If operation was cancelled by us, treat as normal timeout and discard any bytes.
+                    if (gle == ERROR_OPERATION_ABORTED) {
+                        // Discard any stale RX data that may have arrived after the deadline but before cancel completed.
+                        PurgeComm(h_, PURGE_RXCLEAR);
+                        return 0;
+                    }
+                    // other error -> real serial error
+                    PurgeComm(h_, PURGE_RXCLEAR);
+                    return -1;
+                }
+                // If GetOverlappedResult succeeded after cancellation, we intentionally discard those bytes
+                // because they arrived too late (they completed after deadline).
+                (void)got; // ignore
+                PurgeComm(h_, PURGE_RXCLEAR);
                 CloseHandle(ov.hEvent);
-                return (int)got;
+                return 0;
             }
-            CloseHandle(ov.hEvent);
-            return 0; // timed out before any bytes
+            else {
+                // Wait failure; attempt to cancel and treat as error
+                CancelIoEx(h_, &ov);
+                CloseHandle(ov.hEvent);
+                return -1;
+            }
         }
         else {
-            // wait error
+            // Wait error
             CancelIoEx(h_, &ov);
+            // wait for it to finish to be safe
+            WaitForSingleObject(ov.hEvent, INFINITE);
             CloseHandle(ov.hEvent);
             return -1;
         }
+    }
+
+    bool discardRx() {
+        if (h_ == INVALID_HANDLE_VALUE) return false;
+        return PurgeComm(h_, PURGE_RXCLEAR) ? true : false;
     }
 
     bool valid() const { return h_ != INVALID_HANDLE_VALUE; }
@@ -273,8 +318,9 @@ int main() {
                 printHexLine("RX", rx_ts, rxbuf, (size_t)r);
                 // STOP listening for further RX this cycle; we did exactly one read
             }
-            // r == 0 => timed out before deadline, print nothing
+            // r == 0 => timed out before deadline, print nothing (and stale RX already discarded inside readOnceUntil)
         }
+
         // 5) Advance to next absolute deadline (no catch-up bursts)
         next_tx += period;
         // loop repeats; sleep_until(next_tx) at top ensures absolute periodic schedule
