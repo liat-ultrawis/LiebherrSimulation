@@ -231,11 +231,45 @@ private:
     HANDLE h_;
 };
 
-// ---------------- V1.05 protocol (TX unchanged) ----------------
+// ---------------- V1.05 protocol (TX with configurable realistic values) ----------------
 static void buildPlcPacket(uint8_t out[28], uint32_t counter) {
     std::memset(out, 0, 28);
     out[0] = 0xC0; // STX
     out[4] = (uint8_t)(1u << 5); // position data valid
+
+    // Simulate changing values based on counter for realistic movement
+    // Slewing angle: 0–32766 decimal, scaling 359.9° ? 3599
+    // Range: 0–3599 (0–359.9°), cycle through 0–180° continuously
+    uint16_t slew_angle = (counter % 1800) * 2;  // 0–3599 over 1800 cycles
+    out[5] = (uint8_t)(slew_angle & 0x7F);        // DB1-7 (bits 1-7)
+    out[6] = (uint8_t)((slew_angle >> 8) & 0x7F); // DB9-15 (bits 9-15)
+    if (slew_angle & 0x0001) out[23] |= 0x01; // DB0 ? byte 23 bit 0
+    if (slew_angle & 0x0100) out[23] |= 0x02; // DB8 ? byte 23 bit 1
+
+    // Slewing speed: 0–32766 decimal, scaling 0.1 1/min ? 100
+    // Range: 0–100 (0–10 1/min), vary 0–50 1/min
+    uint16_t slew_speed = (counter % 500) % 51;  // 0–50 over 500 cycles
+    out[7] = (uint8_t)(slew_speed & 0x7F);        // DB1-7 (bits 1-7)
+    out[8] = (uint8_t)((slew_speed >> 8) & 0x7F); // DB9-15 (bits 9-15)
+    if (slew_speed & 0x0001) out[23] |= 0x04; // DB0 ? byte 23 bit 2
+    if (slew_speed & 0x0100) out[23] |= 0x08; // DB8 ? byte 23 bit 3
+
+    // Trolley distance: 0–32766 decimal, scaling 99.9 m ? 999
+    // Range: 0–999 (0–99.9 m), vary 0–50 m
+    uint16_t trolley_dist = (counter % 500) % 501;  // 0–500 over 500 cycles
+    out[9] = (uint8_t)(trolley_dist & 0x7F);        // DB1-7 (bits 1-7)
+    out[10] = (uint8_t)((trolley_dist >> 8) & 0x7F); // DB9-15 (bits 9-15)
+    if (trolley_dist & 0x0001) out[23] |= 0x10; // DB0 ? byte 23 bit 4
+    if (trolley_dist & 0x0100) out[23] |= 0x20; // DB8 ? byte 23 bit 5
+
+    // Wind speed: 0–32766 decimal, scaling 10.4 m/s ? 104
+    // Range: 0–104 (0–10.4 m/s), vary 0–52 m/s
+    uint16_t wind = (counter % 520) % 105;  // 0–104 over 520 cycles
+    out[17] = (uint8_t)(wind & 0x7F);        // DB1-7 (bits 1-7)
+    out[18] = (uint8_t)((wind >> 8) & 0x7F); // DB9-15 (bits 9-15)
+    if (wind & 0x0001) out[25] |= 0x01; // DB0 ? byte 25 bit 0
+    if (wind & 0x0100) out[25] |= 0x02; // DB8 ? byte 25 bit 1
+
     out[21] = (uint8_t)(counter & 0x7F);
     out[22] = (uint8_t)((counter >> 7) & 0x7F);
     uint8_t xr = 0;
@@ -243,7 +277,6 @@ static void buildPlcPacket(uint8_t out[28], uint32_t counter) {
     out[26] = (uint8_t)(xr & 0x7F);
     out[27] = 0x80; // ETX
 }
-
 // ---------------- Timestamp helper (monotonic, ms precision) ----------------
 static steady_clock::time_point g_start_time;
 static void formatElapsed(char* buf, size_t buflen, steady_clock::time_point tp) {
