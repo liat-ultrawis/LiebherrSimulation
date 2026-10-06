@@ -270,6 +270,22 @@ static void buildPlcPacket(uint8_t out[28], uint32_t counter) {
     if (wind & 0x0001) out[25] |= 0x01; // DB0 ? byte 25 bit 0
     if (wind & 0x0100) out[25] |= 0x02; // DB8 ? byte 25 bit 1
 
+    // Lifting height: 0–32766 decimal, scaling 999.9 m ? 9999
+    // Range: 0–9999 (0–999.9 m), vary 0–500 m (0–5000 raw)
+    uint16_t lifting_height = (counter % 5000) % 5001;  // 0–5000 over 5000 cycles
+    out[13] = (uint8_t)(lifting_height & 0x7F);        // DB1-7 (bits 1-7)
+    out[14] = (uint8_t)((lifting_height >> 8) & 0x7F); // DB9-15 (bits 9-15)
+    if (lifting_height & 0x0001) out[24] |= 0x04; // DB0 ? byte 24 bit 2
+    if (lifting_height & 0x0100) out[24] |= 0x08; // DB8 ? byte 24 bit 3
+
+    // Load: 0–32766 decimal, scaling 2.13 t ? 213
+    // Range: 0–213 (0–2.13 t), vary 0–213 t
+    uint16_t load_raw = (counter % 214) % 214;  // 0–213 over 214 cycles
+    out[15] = (uint8_t)(load_raw & 0x7F);        // DB1-7 (bits 1-7)
+    out[16] = (uint8_t)((load_raw >> 8) & 0x7F); // DB9-15 (bits 9-15)
+    if (load_raw & 0x0001) out[24] |= 0x10; // DB0 ? byte 24 bit 4
+    if (load_raw & 0x0100) out[24] |= 0x20; // DB8 ? byte 24 bit 5
+
     out[21] = (uint8_t)(counter & 0x7F);
     out[22] = (uint8_t)((counter >> 7) & 0x7F);
     uint8_t xr = 0;
