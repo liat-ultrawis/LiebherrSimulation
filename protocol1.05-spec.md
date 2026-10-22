@@ -13,8 +13,8 @@
 	parity 	   even 
 
 3. Data exchange
-	- The master (CSM485modul) sends the data packets in cycles of 50ms to the slave (ACS).
-	- The slave has to answer with his data packet before the master changes his interface back to the sending state(less then 50ms)
+	- The master (CSM485modul) sends the data packets in cycles of 130ms to the slave (ACS).
+	- The slave has to answer with his data packet before the master changes his interface back to the sending state(less then 130ms)
 	- If there will be three wrong consecutive packets, the master will detect on a communication error and all drives will be stopped.
 	- Additional the slave has to check, if there is a lack of information. In this case the slave has to set the system in a secure state. 
 	
