@@ -24,4 +24,12 @@
     <None Include="LiebherrPlcSimulatorV105\LiebherrPlcSimulatorV105.vcxproj" />
     <None Include="LiebherrPlcSimulatorV105\config.ini" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="LiebherrPlcSimulatorV105\plc_protocol.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="LiebherrPlcSimulatorV105\plc_selftest.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
 </Project>
