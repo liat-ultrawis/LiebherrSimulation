@@ -274,6 +274,17 @@ static void pushLog(const std::string& s) {
     while (g_log.size() > MAX_PENDING_LOG) g_log.pop_front();
 }
 
+// Arrow keys -> motion commands. Polled (no WM_KEYDOWN/UP), so a release is never missed.
+// Only active while the simulator window is the foreground window; otherwise all keys count as released.
+static void readMotionKeys(int& slewCmd, int& trolleyCmd) {
+    slewCmd = 0;
+    trolleyCmd = 0;
+    if (g_hwnd == nullptr || GetForegroundWindow() != g_hwnd) return;
+    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    slewCmd = plc105::motionCommand(down(VK_RIGHT), down(VK_LEFT));
+    trolleyCmd = plc105::motionCommand(down(VK_UP), down(VK_DOWN));
+}
+
 // ---------------- Communication worker (TX every 130 ms, RX in between) ----------------
 static void simWorker(plc105::SimConfig cfg, std::string comPort) {
     SerialPort sp;
@@ -289,15 +300,34 @@ static void simWorker(plc105::SimConfig cfg, std::string comPort) {
     g_start_time = steady_clock::now();
     cfg.reset();
 
+    // Keyboard motion: start at the GUI Min values; trolley limited to the GUI Min..Max range.
+    plc105::MotionState motion;
+    {
+        const auto& ang = cfg.values[plc105::VAL_SLEW_ANGLE];
+        const auto& trl = cfg.values[plc105::VAL_TROLLEY_DISTANCE];
+        const double angDiv = plc105::kPlcValues[plc105::VAL_SLEW_ANGLE].divisor;
+        const double trlDiv = plc105::kPlcValues[plc105::VAL_TROLLEY_DISTANCE].divisor;
+        motion.reset(ang.minValue / angDiv, trl.minValue / trlDiv, trl.minValue / trlDiv, trl.maxValue / trlDiv);
+    }
+
     const ms period(130);
     auto next_tx = steady_clock::now();
+    auto last_motion = next_tx;
 
     while (!g_stopReq.load()) {
         std::this_thread::sleep_until(next_tx);
         if (g_stopReq.load()) break;
 
-        // 1) Build and send PLC frame from current parameters
-        const plc105::PlcFrameData data = cfg.frameData();
+        // 1) Update motion with the actual elapsed time, then build and send the PLC frame
+        const auto now = steady_clock::now();
+        const double dt = std::chrono::duration<double>(now - last_motion).count();
+        last_motion = now;
+        int slewCmd = 0, trolleyCmd = 0;
+        readMotionKeys(slewCmd, trolleyCmd);
+        motion.update(slewCmd, trolleyCmd, dt);
+
+        plc105::PlcFrameData data = cfg.frameData();
+        motion.apply(data);
         uint8_t tx[plc105::PLC_FRAME_LEN];
         plc105::buildPlcFrame(data, tx);
         auto tx_ts = steady_clock::now();

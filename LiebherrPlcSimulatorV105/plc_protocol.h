@@ -319,4 +319,115 @@ struct SimConfig {
     }
 };
 
+// ---------------- Keyboard-controlled motion (slewing / trolley) ----------------
+// Velocity sign convention: slewing + = right, - = left; trolley + = out (forward), - = in (backward).
+// All updates are time based (dt in seconds); the 130 ms TX period and frame encoding are unchanged.
+struct MotionParams {
+    double maxSpeed;      // slewing: 1/min,        trolley: m/s
+    double acceleration;  // slewing: (1/min) per s, trolley: m/s^2
+    double deceleration;  // slewing: (1/min) per s, trolley: m/s^2
+};
+
+// Tuning constants (not in config.ini yet)
+static const MotionParams kSlewMotion = { 0.8, 0.4, 0.4 };
+static const MotionParams kTrolleyMotion = { 1.0, 0.5, 0.5 };
+const double MOTION_MAX_DT_S = 0.5;  // larger elapsed times (stalls, debugger) are clamped
+
+// Indices into kPlcBits / kPlcValues for the keyboard-controlled fields
+const int BIT_SLEW_RIGHT = 3;        // 1.State/3 slewing gear right
+const int BIT_SLEW_LEFT = 4;         // 1.State/4 slewing gear left
+const int BIT_TROLLEY_FORWARD = 5;   // 1.State/5 trolley forw. / jib outside
+const int BIT_TROLLEY_BACKWARD = 6;  // 1.State/6 trolley backw. / jib inside
+const int VAL_SLEW_ANGLE = 0;
+const int VAL_SLEW_SPEED = 1;
+const int VAL_TROLLEY_DISTANCE = 2;
+const uint16_t SLEW_ANGLE_RAW_FULL = 3600; // 360.0 deg wraps to 0.0
+
+// Two opposite keys -> command -1/0/+1 (both or none pressed = 0)
+inline int motionCommand(bool positive, bool negative) {
+    if (positive == negative) return 0;
+    return positive ? 1 : -1;
+}
+
+struct AxisMotion {
+    double velocity = 0.0;
+
+    // Released or opposite command: decelerate toward 0 (never crosses zero in one step).
+    // Same direction or standing: accelerate toward +/-maxSpeed.
+    void update(int cmd, double dt, const MotionParams& p) {
+        if (velocity != 0.0 && (cmd == 0 || (velocity > 0.0) != (cmd > 0))) {
+            const double dv = p.deceleration * dt;
+            velocity = std::fabs(velocity) <= dv ? 0.0 : velocity - (velocity > 0.0 ? dv : -dv);
+        }
+        else if (cmd != 0) {
+            const double target = cmd * p.maxSpeed;
+            const double dv = p.acceleration * dt;
+            if (std::fabs(target - velocity) <= dv) velocity = target;
+            else velocity += (target > velocity ? dv : -dv);
+        }
+    }
+};
+
+inline double wrapAngle360(double a) {
+    a = std::fmod(a, 360.0);
+    if (a < 0.0) a += 360.0;
+    return a;
+}
+
+inline uint16_t motionToRaw(double eng, double divisor) {
+    const double r = std::floor(eng * divisor + 0.5);
+    if (!(r > 0.0)) return 0;
+    return r > VALUE_MAX ? VALUE_MAX : (uint16_t)r;
+}
+
+struct MotionState {
+    AxisMotion slew;
+    AxisMotion trolley;
+    double slewAngleDeg = 0.0;
+    double trolleyPosM = 0.0;
+    double trolleyMinM = 0.0;
+    double trolleyMaxM = 0.0;
+
+    void reset(double angleDeg, double posM, double minM, double maxM) {
+        slew.velocity = 0.0;
+        trolley.velocity = 0.0;
+        slewAngleDeg = wrapAngle360(angleDeg);
+        trolleyMinM = minM;
+        trolleyMaxM = maxM < minM ? minM : maxM;
+        trolleyPosM = posM < trolleyMinM ? trolleyMinM : (posM > trolleyMaxM ? trolleyMaxM : posM);
+    }
+
+    // Position integration uses the average velocity over dt (exact for constant acceleration).
+    void update(int slewCmd, int trolleyCmd, double dt) {
+        if (!(dt > 0.0)) return;                       // zero, negative or NaN: no change
+        if (dt > MOTION_MAX_DT_S) dt = MOTION_MAX_DT_S;
+
+        const double v0s = slew.velocity;
+        slew.update(slewCmd, dt, kSlewMotion);
+        // 1/min -> deg/s: * 360 / 60
+        slewAngleDeg = wrapAngle360(slewAngleDeg + 0.5 * (v0s + slew.velocity) * 6.0 * dt);
+
+        const double v0t = trolley.velocity;
+        trolley.update(trolleyCmd, dt, kTrolleyMotion);
+        double pos = trolleyPosM + 0.5 * (v0t + trolley.velocity) * dt;
+        if (pos >= trolleyMaxM) { pos = trolleyMaxM; if (trolley.velocity > 0.0) trolley.velocity = 0.0; }
+        if (pos <= trolleyMinM) { pos = trolleyMinM; if (trolley.velocity < 0.0) trolley.velocity = 0.0; }
+        trolleyPosM = pos;
+    }
+
+    // Overrides only the keyboard-controlled fields; all other bits/values are left untouched.
+    void apply(PlcFrameData& d) const {
+        d.bits[BIT_SLEW_RIGHT] = slew.velocity > 0.0;
+        d.bits[BIT_SLEW_LEFT] = slew.velocity < 0.0;
+        d.bits[BIT_TROLLEY_FORWARD] = trolley.velocity > 0.0;
+        d.bits[BIT_TROLLEY_BACKWARD] = trolley.velocity < 0.0;
+
+        uint16_t a = motionToRaw(slewAngleDeg, kPlcValues[VAL_SLEW_ANGLE].divisor);
+        if (a >= SLEW_ANGLE_RAW_FULL) a = (uint16_t)(a - SLEW_ANGLE_RAW_FULL);
+        d.values[VAL_SLEW_ANGLE] = a;
+        d.values[VAL_SLEW_SPEED] = motionToRaw(std::fabs(slew.velocity), kPlcValues[VAL_SLEW_SPEED].divisor);
+        d.values[VAL_TROLLEY_DISTANCE] = motionToRaw(trolleyPosM, kPlcValues[VAL_TROLLEY_DISTANCE].divisor);
+    }
+};
+
 } // namespace plc105

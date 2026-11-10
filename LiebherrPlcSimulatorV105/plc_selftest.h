@@ -219,6 +219,107 @@ inline void testEngToRaw() {
     for (uint16_t e : expect) { PLC_CHECK(p.value() == e); p.advance(); }
 }
 
+inline bool motionNear(double a, double b) { return std::fabs(a - b) < 1e-9; }
+
+inline void testMotion() {
+    const MotionParams& sp = kSlewMotion;   // max 0.8, acc 0.4, dec 0.4
+
+    // Acceleration from zero is time based
+    AxisMotion a;
+    a.update(1, 0.5, sp);  PLC_CHECK(motionNear(a.velocity, 0.2));
+    a.update(1, 0.25, sp); PLC_CHECK(motionNear(a.velocity, 0.3));
+
+    // Reaching max speed and staying there
+    for (int k = 0; k < 50; ++k) { a.update(1, 0.13, sp); PLC_CHECK(a.velocity <= sp.maxSpeed + 1e-12); }
+    PLC_CHECK(motionNear(a.velocity, sp.maxSpeed));
+
+    // Deceleration after release (gradual, then stopped)
+    a.update(0, 1.0, sp); PLC_CHECK(motionNear(a.velocity, 0.4));
+    a.update(0, 1.5, sp); PLC_CHECK(a.velocity == 0.0);
+    a.update(0, 1.0, sp); PLC_CHECK(a.velocity == 0.0);
+
+    // Direction reversal goes through zero
+    a.velocity = sp.maxSpeed;
+    a.update(-1, 1.0, sp); PLC_CHECK(motionNear(a.velocity, 0.4));
+    a.update(-1, 1.5, sp); PLC_CHECK(a.velocity == 0.0);
+    a.update(-1, 1.0, sp); PLC_CHECK(motionNear(a.velocity, -0.4));
+    a.velocity = sp.maxSpeed;
+    bool sawZero = false;
+    for (int k = 0; k < 100; ++k) {
+        a.update(-1, 0.13, sp);
+        if (a.velocity == 0.0) sawZero = true;
+        if (a.velocity < 0.0) PLC_CHECK(sawZero);
+    }
+    PLC_CHECK(motionNear(a.velocity, -sp.maxSpeed));
+
+    // Simultaneous opposite keys -> target 0
+    PLC_CHECK(motionCommand(true, true) == 0);
+    PLC_CHECK(motionCommand(false, false) == 0);
+    PLC_CHECK(motionCommand(true, false) == 1);
+    PLC_CHECK(motionCommand(false, true) == -1);
+    a.velocity = sp.maxSpeed;
+    a.update(motionCommand(true, true), 1.0, sp); PLC_CHECK(motionNear(a.velocity, 0.4));
+    AxisMotion z;
+    z.update(motionCommand(true, true), 1.0, sp); PLC_CHECK(z.velocity == 0.0);
+
+    // Large dt is clamped; zero/negative dt changes nothing
+    MotionState m; m.reset(0.0, 0.0, 0.0, 100.0);
+    m.update(1, 1, 10.0);
+    PLC_CHECK(motionNear(m.slew.velocity, kSlewMotion.acceleration * MOTION_MAX_DT_S));
+    PLC_CHECK(motionNear(m.trolley.velocity, kTrolleyMotion.acceleration * MOTION_MAX_DT_S));
+    MotionState n; n.reset(10.0, 3.0, 0.0, 6.0);
+    n.update(1, 1, 0.0); n.update(1, 1, -1.0);
+    PLC_CHECK(n.slew.velocity == 0.0 && n.trolley.velocity == 0.0);
+    PLC_CHECK(motionNear(n.slewAngleDeg, 10.0) && motionNear(n.trolleyPosM, 3.0));
+
+    // Trolley limits (configured range 2.0 .. 6.0 m)
+    MotionState t; t.reset(0.0, 5.0, 2.0, 6.0);
+    for (int k = 0; k < 200; ++k) { t.update(0, 1, 0.13); PLC_CHECK(t.trolleyPosM <= 6.0); }
+    PLC_CHECK(t.trolleyPosM == 6.0 && t.trolley.velocity == 0.0);
+    PlcFrameData d = {};
+    t.apply(d);
+    PLC_CHECK(d.values[VAL_TROLLEY_DISTANCE] == 60 && !d.bits[BIT_TROLLEY_FORWARD]);
+    for (int k = 0; k < 400; ++k) { t.update(0, -1, 0.13); PLC_CHECK(t.trolleyPosM >= 2.0); }
+    PLC_CHECK(t.trolleyPosM == 2.0 && t.trolley.velocity == 0.0);
+    t.reset(0.0, 9.0, 2.0, 6.0); PLC_CHECK(t.trolleyPosM == 6.0);
+
+    // Slew angle wrapping (0.8 1/min = 4.8 deg/s)
+    MotionState w; w.reset(359.5, 0.0, 0.0, 0.0);
+    w.slew.velocity = 0.8;
+    w.update(1, 0, 0.5);
+    PLC_CHECK(std::fabs(w.slewAngleDeg - 1.9) < 1e-6);
+    d = {};
+    w.apply(d);
+    PLC_CHECK(d.values[VAL_SLEW_ANGLE] == 19 && d.values[VAL_SLEW_SPEED] == 800);
+    PLC_CHECK(d.bits[BIT_SLEW_RIGHT] && !d.bits[BIT_SLEW_LEFT]);
+    w.reset(0.5, 0.0, 0.0, 0.0);
+    w.slew.velocity = -0.8;
+    w.update(-1, 0, 0.5);
+    d = {};
+    w.apply(d);
+    PLC_CHECK(d.values[VAL_SLEW_ANGLE] == 3581 && d.bits[BIT_SLEW_LEFT] && !d.bits[BIT_SLEW_RIGHT]);
+    w.reset(725.0, 0.0, 0.0, 0.0); PLC_CHECK(std::fabs(w.slewAngleDeg - 5.0) < 1e-9);
+
+    // Zero velocity: no movement, no direction bits; other fields untouched
+    MotionState s; s.reset(123.4, 3.0, 0.0, 6.0);
+    for (int k = 0; k < 10; ++k) s.update(0, 0, 0.13);
+    PLC_CHECK(std::fabs(s.slewAngleDeg - 123.4) < 1e-9 && s.trolleyPosM == 3.0);
+    d = {};
+    d.bits[1] = true; d.bits[BIT_SLEW_RIGHT] = true; d.values[5] = 213;
+    s.apply(d);
+    PLC_CHECK(!d.bits[BIT_SLEW_RIGHT] && !d.bits[BIT_SLEW_LEFT]);
+    PLC_CHECK(!d.bits[BIT_TROLLEY_FORWARD] && !d.bits[BIT_TROLLEY_BACKWARD]);
+    PLC_CHECK(d.values[VAL_SLEW_ANGLE] == 1234 && d.values[VAL_SLEW_SPEED] == 0 && d.values[VAL_TROLLEY_DISTANCE] == 30);
+    PLC_CHECK(d.bits[1] && d.values[5] == 213);
+
+    // Motion values survive the unchanged frame encoding
+    uint8_t f[PLC_FRAME_LEN];
+    buildPlcFrame(d, f);
+    PlcFrameData r = {};
+    std::string err;
+    PLC_CHECK(decodePlcFrame(f, PLC_FRAME_LEN, r, err) && r.values[VAL_SLEW_ANGLE] == 1234);
+}
+
 inline int runSelfTests() {
     g_testFailures = 0;
     testValuePacking();
@@ -227,9 +328,11 @@ inline int runSelfTests() {
     testProgression();
     testTxLogDecodesFrame();
     testEngToRaw();
+    testMotion();
     if (g_testFailures == 0) std::printf("SELFTEST PASSED\n");
     else std::printf("SELFTEST FAILED: %d check(s)\n", g_testFailures);
     return g_testFailures == 0 ? 0 : 1;
 }
+
 
 } // namespace plc105
