@@ -329,8 +329,8 @@ struct MotionParams {
 };
 
 // Tuning constants (not in config.ini yet)
-const MotionParams kSlewMotion = { 0.8, 0.4, 0.4 };
-const MotionParams kTrolleyMotion = { 1.0, 0.5, 0.5 };
+const MotionParams kSlewMotion = { 0.8/3.9, 0.4, 0.4 };
+const MotionParams kTrolleyMotion = { 1.8, 0.5, 0.5 };
 const double MOTION_MAX_DT_S = 0.5;  // larger elapsed times (stalls, debugger) are clamped
 
 // Indices into kPlcBits / kPlcValues for the keyboard-controlled fields
