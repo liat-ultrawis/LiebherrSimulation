@@ -314,6 +314,8 @@ static void simWorker(plc105::SimConfig cfg, std::string comPort) {
     auto next_tx = steady_clock::now();
     auto last_motion = next_tx;
 
+    plc105::MotionLimits acsLimits;   // last valid ACS restrictions (NORMAL until first valid response)
+
     while (!g_stopReq.load()) {
         std::this_thread::sleep_until(next_tx);
         if (g_stopReq.load()) break;
@@ -324,7 +326,7 @@ static void simWorker(plc105::SimConfig cfg, std::string comPort) {
         last_motion = now;
         int slewCmd = 0, trolleyCmd = 0;
         readMotionKeys(slewCmd, trolleyCmd);
-        motion.update(slewCmd, trolleyCmd, dt);
+        motion.update(slewCmd, trolleyCmd, dt, acsLimits);
 
         plc105::PlcFrameData data = cfg.frameData();
         motion.apply(data);
@@ -389,6 +391,8 @@ static void simWorker(plc105::SimConfig cfg, std::string comPort) {
                 else {
                     if (!plc105::validateAcsFrame(s, plc105::ACS_FRAME_LEN, err))
                         line += "\n   INVALID: " + err;
+                    else
+                        acsLimits = plc105::decodeAcsRestrictions(s); 
                     if (avail > plc105::ACS_FRAME_LEN)
                         line += "\n   NOTE: " + std::to_string(avail - plc105::ACS_FRAME_LEN) + " extra byte(s) after frame";
                     line += "\n   " + plc105::formatAcsDecoded(s);
@@ -406,7 +410,6 @@ static void simWorker(plc105::SimConfig cfg, std::string comPort) {
     pushLog("Port closed, simulation stopped");
     PostMessageW(g_hwnd, WM_APP_STOPPED, 0, 0);
 }
-
 // ---------------- GUI ----------------
 enum : int {
     ID_START = 100, ID_STOP = 101, ID_STATUS = 102, ID_LOG = 103, ID_CLEAR = 104,

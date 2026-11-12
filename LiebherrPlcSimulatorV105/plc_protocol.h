@@ -329,8 +329,8 @@ struct MotionParams {
 };
 
 // Tuning constants (not in config.ini yet)
-static const MotionParams kSlewMotion = { 0.8, 0.4, 0.4 };
-static const MotionParams kTrolleyMotion = { 1.0, 0.5, 0.5 };
+const MotionParams kSlewMotion = { 0.8, 0.4, 0.4 };
+const MotionParams kTrolleyMotion = { 1.0, 0.5, 0.5 };
 const double MOTION_MAX_DT_S = 0.5;  // larger elapsed times (stalls, debugger) are clamped
 
 // Indices into kPlcBits / kPlcValues for the keyboard-controlled fields
@@ -352,21 +352,60 @@ inline int motionCommand(bool positive, bool negative) {
 struct AxisMotion {
     double velocity = 0.0;
 
-    // Released or opposite command: decelerate toward 0 (never crosses zero in one step).
-    // Same direction or standing: accelerate toward +/-maxSpeed.
-    void update(int cmd, double dt, const MotionParams& p) {
-        if (velocity != 0.0 && (cmd == 0 || (velocity > 0.0) != (cmd > 0))) {
-            const double dv = p.deceleration * dt;
-            velocity = std::fabs(velocity) <= dv ? 0.0 : velocity - (velocity > 0.0 ? dv : -dv);
+    // cmd: -1/0/+1. limPos/limNeg: allowed speed fraction for the + / - direction (1 = NORMAL, 0 = STOP).
+    // Moving against the target decelerates to exactly 0 first (no sign change within one step).
+    void update(int cmd, double dt, const MotionParams& p, double limPos = 1.0, double limNeg = 1.0) {
+        if (!(dt > 0.0)) return;
+        double target = 0.0;
+        if (cmd > 0) target = p.maxSpeed * limPos;
+        else if (cmd < 0) target = -p.maxSpeed * limNeg;
+
+        if (velocity > 0.0 && target < velocity) {
+            const double lo = target > 0.0 ? target : 0.0;
+            velocity -= p.deceleration * dt;
+            if (velocity < lo) velocity = lo;
         }
-        else if (cmd != 0) {
-            const double target = cmd * p.maxSpeed;
-            const double dv = p.acceleration * dt;
-            if (std::fabs(target - velocity) <= dv) velocity = target;
-            else velocity += (target > velocity ? dv : -dv);
+        else if (velocity < 0.0 && target > velocity) {
+            const double hi = target < 0.0 ? target : 0.0;
+            velocity += p.deceleration * dt;
+            if (velocity > hi) velocity = hi;
+        }
+        else if (target > velocity) {
+            velocity += p.acceleration * dt;
+            if (velocity > target) velocity = target;
+        }
+        else if (target < velocity) {
+            velocity -= p.acceleration * dt;
+            if (velocity < target) velocity = target;
         }
     }
 };
+
+// ACS restrictions as allowed speed fraction per direction: 1 = NORMAL, 0 < x < 1 = SLOW, 0 = STOP.
+struct MotionLimits {
+    double slewRight = 1.0;
+    double slewLeft = 1.0;
+    double trolleyOut = 1.0;
+    double trolleyIn = 1.0;
+};
+
+// Spec §7. Priority STOP > SLOW > NORMAL. Expects a validated 8-byte ACS frame.
+inline MotionLimits decodeAcsRestrictions(const uint8_t* p) {
+    static const double kSlewSlow[4] = { 0.10, 0.15, 0.20, 0.25 };   // byte5 bit0/bit1
+    MotionLimits m;
+    // SLOW
+    if (p[4] & 0x10) m.slewRight = m.slewLeft = kSlewSlow[p[5] & 0x03];   // slew slowly to border
+    const double trolleySlow = (p[5] & 0x04) ? 0.25 : 0.50;               // pre-limitswitch max speed
+    if (p[2] & 0x10) m.trolleyOut = trolleySlow;                          // limit forward trolleying
+    if (p[2] & 0x20) m.trolleyIn = trolleySlow;                           // limit backward trolleying
+    // STOP (overrides SLOW)
+    if (p[1] & 0x01) m.slewRight = 0.0;                                   // Stopp slewing right
+    if (p[1] & 0x02) m.slewLeft = 0.0;                                    // Stopp slewing left
+    if (p[2] & 0x04) m.trolleyOut = 0.0;                                  // Stopp forward trolleying
+    if (p[2] & 0x08) m.trolleyIn = 0.0;                                   // Stopp backward trolleying
+    if (p[4] & 0x40) m.slewRight = m.slewLeft = m.trolleyOut = m.trolleyIn = 0.0; // Stopp all motions
+    return m;
+}
 
 inline double wrapAngle360(double a) {
     a = std::fmod(a, 360.0);
@@ -398,17 +437,17 @@ struct MotionState {
     }
 
     // Position integration uses the average velocity over dt (exact for constant acceleration).
-    void update(int slewCmd, int trolleyCmd, double dt) {
+    void update(int slewCmd, int trolleyCmd, double dt, const MotionLimits& lim = MotionLimits()) {
         if (!(dt > 0.0)) return;                       // zero, negative or NaN: no change
         if (dt > MOTION_MAX_DT_S) dt = MOTION_MAX_DT_S;
 
         const double v0s = slew.velocity;
-        slew.update(slewCmd, dt, kSlewMotion);
+        slew.update(slewCmd, dt, kSlewMotion, lim.slewRight, lim.slewLeft);
         // 1/min -> deg/s: * 360 / 60
         slewAngleDeg = wrapAngle360(slewAngleDeg + 0.5 * (v0s + slew.velocity) * 6.0 * dt);
 
         const double v0t = trolley.velocity;
-        trolley.update(trolleyCmd, dt, kTrolleyMotion);
+        trolley.update(trolleyCmd, dt, kTrolleyMotion, lim.trolleyOut, lim.trolleyIn);
         double pos = trolleyPosM + 0.5 * (v0t + trolley.velocity) * dt;
         if (pos >= trolleyMaxM) { pos = trolleyMaxM; if (trolley.velocity > 0.0) trolley.velocity = 0.0; }
         if (pos <= trolleyMinM) { pos = trolleyMinM; if (trolley.velocity < 0.0) trolley.velocity = 0.0; }

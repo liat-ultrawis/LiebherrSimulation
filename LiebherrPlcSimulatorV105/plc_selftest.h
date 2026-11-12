@@ -320,6 +320,93 @@ inline void testMotion() {
     PLC_CHECK(decodePlcFrame(f, PLC_FRAME_LEN, r, err) && r.values[VAL_SLEW_ANGLE] == 1234);
 }
 
+inline void makeAcsFrame(uint8_t f[8], uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4, uint8_t b5) {
+    f[0] = STX; f[1] = b1; f[2] = b2; f[3] = b3; f[4] = b4; f[5] = b5;
+    f[6] = xorChecksum(f, 1, 5); f[7] = ETX;
+}
+
+inline void testRestrictions() {
+    uint8_t f[8];
+    std::string err;
+
+    // Decoding + priority STOP > SLOW > NORMAL
+    makeAcsFrame(f, 0x05, 0x00, 0x08, 0x00, 0x00);          // StopSlewRight (+ step/hook bits ignored)
+    PLC_CHECK(validateAcsFrame(f, 8, err));
+    MotionLimits L = decodeAcsRestrictions(f);
+    PLC_CHECK(L.slewRight == 0.0 && L.slewLeft == 1.0 && L.trolleyOut == 1.0 && L.trolleyIn == 1.0);
+    makeAcsFrame(f, 0x00, 0x14, 0x00, 0x00, 0x00);          // Stop + Limit trolley out -> STOP
+    L = decodeAcsRestrictions(f);
+    PLC_CHECK(L.trolleyOut == 0.0 && L.trolleyIn == 1.0);
+    makeAcsFrame(f, 0x00, 0x20, 0x00, 0x10, 0x07);          // limit in 25%, slew slow 25%
+    L = decodeAcsRestrictions(f);
+    PLC_CHECK(motionNear(L.trolleyIn, 0.25) && L.trolleyOut == 1.0);
+    PLC_CHECK(motionNear(L.slewRight, 0.25) && motionNear(L.slewLeft, 0.25));
+    makeAcsFrame(f, 0x00, 0x00, 0x00, 0x40, 0x00);          // Stop all motions
+    L = decodeAcsRestrictions(f);
+    PLC_CHECK(L.slewRight == 0.0 && L.slewLeft == 0.0 && L.trolleyOut == 0.0 && L.trolleyIn == 0.0);
+
+    // STOP trolley out while key held: gradual deceleration, then stays stopped
+    makeAcsFrame(f, 0x00, 0x04, 0x00, 0x00, 0x00);
+    L = decodeAcsRestrictions(f);
+    MotionState m; m.reset(0.0, 50.0, 0.0, 100.0);
+    m.trolley.velocity = kTrolleyMotion.maxSpeed;            // 1.0 m/s out
+    m.update(0, 1, 1.0, L); PLC_CHECK(motionNear(m.trolley.velocity, 0.5));
+    m.update(0, 1, 1.0, L); PLC_CHECK(m.trolley.velocity == 0.0);
+    for (int k = 0; k < 20; ++k) { m.update(0, 1, 0.13, L); PLC_CHECK(m.trolley.velocity == 0.0); }
+    PlcFrameData d = {};
+    m.apply(d);
+    PLC_CHECK(!d.bits[BIT_TROLLEY_FORWARD] && !d.bits[BIT_TROLLEY_BACKWARD]);
+
+    // Restriction removed while key still held -> accelerates again (no jump)
+    MotionLimits normal;
+    m.update(0, 1, 0.5, normal); PLC_CHECK(motionNear(m.trolley.velocity, 0.25));
+    for (int k = 0; k < 50; ++k) m.update(0, 1, 0.13, normal);
+    PLC_CHECK(motionNear(m.trolley.velocity, kTrolleyMotion.maxSpeed));
+
+    // SLOW trolley out (50%): decelerate to 0.5 m/s and stay limited
+    makeAcsFrame(f, 0x00, 0x10, 0x00, 0x00, 0x00);
+    L = decodeAcsRestrictions(f);
+    m.update(0, 1, 0.5, L); PLC_CHECK(motionNear(m.trolley.velocity, 0.75));
+    m.update(0, 1, 0.5, L); PLC_CHECK(motionNear(m.trolley.velocity, 0.5));
+    for (int k = 0; k < 20; ++k) { m.update(0, 1, 0.13, L); PLC_CHECK(motionNear(m.trolley.velocity, 0.5)); }
+    // SLOW from standstill: accelerates only up to the limit
+    MotionState s0; s0.reset(0.0, 50.0, 0.0, 100.0);
+    for (int k = 0; k < 50; ++k) { s0.update(0, 1, 0.13, L); PLC_CHECK(s0.trolley.velocity <= 0.5 + 1e-12); }
+    PLC_CHECK(motionNear(s0.trolley.velocity, 0.5));
+    // SLOW removed while held -> back to full speed
+    for (int k = 0; k < 50; ++k) m.update(0, 1, 0.13, normal);
+    PLC_CHECK(motionNear(m.trolley.velocity, kTrolleyMotion.maxSpeed));
+
+    // SLOW slewing (25% of 0.8 = 0.2 1/min)
+    makeAcsFrame(f, 0x00, 0x00, 0x00, 0x10, 0x03);
+    L = decodeAcsRestrictions(f);
+    MotionState w; w.reset(0.0, 0.0, 0.0, 0.0);
+    w.slew.velocity = kSlewMotion.maxSpeed;
+    w.update(1, 0, 0.5, L); PLC_CHECK(motionNear(w.slew.velocity, 0.6));
+    for (int k = 0; k < 30; ++k) { w.update(1, 0, 0.13, L); PLC_CHECK(w.slew.velocity >= 0.2 - 1e-12); }
+    PLC_CHECK(motionNear(w.slew.velocity, 0.2));
+
+    // Opposite directions are independent: STOP slew right does not affect left
+    makeAcsFrame(f, 0x01, 0x00, 0x00, 0x00, 0x00);
+    L = decodeAcsRestrictions(f);
+    MotionState o; o.reset(0.0, 0.0, 0.0, 0.0);
+    for (int k = 0; k < 10; ++k) { o.update(1, 0, 0.13, L); PLC_CHECK(o.slew.velocity == 0.0); }
+    o.update(-1, 0, 1.0, L); PLC_CHECK(motionNear(o.slew.velocity, -0.4));
+    for (int k = 0; k < 50; ++k) o.update(-1, 0, 0.13, L);
+    PLC_CHECK(motionNear(o.slew.velocity, -kSlewMotion.maxSpeed));
+
+    // STOP trolley in: moving in decelerates to 0, moving out still allowed at full speed
+    makeAcsFrame(f, 0x00, 0x08, 0x00, 0x00, 0x00);
+    L = decodeAcsRestrictions(f);
+    MotionState t; t.reset(0.0, 50.0, 0.0, 100.0);
+    t.trolley.velocity = -kTrolleyMotion.maxSpeed;
+    t.update(0, -1, 1.0, L); PLC_CHECK(motionNear(t.trolley.velocity, -0.5));
+    t.update(0, -1, 1.0, L); PLC_CHECK(t.trolley.velocity == 0.0);
+    t.update(0, -1, 1.0, L); PLC_CHECK(t.trolley.velocity == 0.0);
+    for (int k = 0; k < 50; ++k) t.update(0, 1, 0.13, L);
+    PLC_CHECK(motionNear(t.trolley.velocity, kTrolleyMotion.maxSpeed));
+}
+
 inline int runSelfTests() {
     g_testFailures = 0;
     testValuePacking();
@@ -329,10 +416,10 @@ inline int runSelfTests() {
     testTxLogDecodesFrame();
     testEngToRaw();
     testMotion();
+    testRestrictions();
     if (g_testFailures == 0) std::printf("SELFTEST PASSED\n");
     else std::printf("SELFTEST FAILED: %d check(s)\n", g_testFailures);
     return g_testFailures == 0 ? 0 : 1;
 }
-
 
 } // namespace plc105
