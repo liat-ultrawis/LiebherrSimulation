@@ -221,44 +221,69 @@ inline void testEngToRaw() {
 
 inline bool motionNear(double a, double b) { return std::fabs(a - b) < 1e-9; }
 
+// Every motion speed/rate is the original value divided by SPEED_SCALE exactly once.
+inline void testSpeedScaling() {
+    PLC_CHECK(motionNear(kSlewMotion.maxSpeed * SPEED_SCALE, 0.8));
+    PLC_CHECK(motionNear(kSlewMotion.acceleration * SPEED_SCALE, 0.4));
+    PLC_CHECK(motionNear(kSlewMotion.deceleration * SPEED_SCALE, 0.4));
+    PLC_CHECK(motionNear(kTrolleyMotion.maxSpeed * SPEED_SCALE, 1.8));
+    PLC_CHECK(motionNear(kTrolleyMotion.acceleration * SPEED_SCALE, 0.5));
+    PLC_CHECK(motionNear(kTrolleyMotion.deceleration * SPEED_SCALE, 0.5));
+    // Ramp times unchanged by the scaling (slew 2 s, trolley 3.6 s to max)
+    PLC_CHECK(motionNear(kSlewMotion.maxSpeed / kSlewMotion.acceleration, 2.0));
+    PLC_CHECK(motionNear(kTrolleyMotion.maxSpeed / kTrolleyMotion.acceleration, 3.6));
+    // SLOW steps stay proportional to the scaled max (fraction applied once, not rescaled)
+    uint8_t f[8] = { STX, 0x00, 0x00, 0x00, 0x10, 0x03, 0x00, ETX };
+    f[6] = xorChecksum(f, 1, 5);
+    MotionState w; w.reset(0.0, 0.0, 0.0, 0.0);
+    for (int k = 0; k < 100; ++k) w.update(1, 0, 0.13, decodeAcsRestrictions(f));
+    PLC_CHECK(motionNear(w.slew.velocity, 0.25 * 0.8 / SPEED_SCALE));
+    // Transmitted Value 01 at full slew speed: 0.8/3.9 1/min -> raw 205
+    PlcFrameData d = {};
+    w.slew.velocity = kSlewMotion.maxSpeed;
+    w.apply(d);
+    PLC_CHECK(d.values[VAL_SLEW_SPEED] == 205);
+}
+
 inline void testMotion() {
-    const MotionParams& sp = kSlewMotion;   // max 0.8, acc 0.4, dec 0.4
+    const MotionParams& sp = kSlewMotion;
+    const double vmax = sp.maxSpeed, acc = sp.acceleration, dec = sp.deceleration;
 
     // Acceleration from zero is time based
     AxisMotion a;
-    a.update(1, 0.5, sp);  PLC_CHECK(motionNear(a.velocity, 0.2));
-    a.update(1, 0.25, sp); PLC_CHECK(motionNear(a.velocity, 0.3));
+    a.update(1, 0.25, sp); PLC_CHECK(motionNear(a.velocity, acc * 0.25));
+    a.update(1, 0.25, sp); PLC_CHECK(motionNear(a.velocity, acc * 0.5));
 
     // Reaching max speed and staying there
-    for (int k = 0; k < 50; ++k) { a.update(1, 0.13, sp); PLC_CHECK(a.velocity <= sp.maxSpeed + 1e-12); }
-    PLC_CHECK(motionNear(a.velocity, sp.maxSpeed));
+    for (int k = 0; k < 50; ++k) { a.update(1, 0.13, sp); PLC_CHECK(a.velocity <= vmax + 1e-12); }
+    PLC_CHECK(motionNear(a.velocity, vmax));
 
     // Deceleration after release (gradual, then stopped)
-    a.update(0, 1.0, sp); PLC_CHECK(motionNear(a.velocity, 0.4));
+    a.update(0, 1.0, sp); PLC_CHECK(motionNear(a.velocity, vmax - dec));
     a.update(0, 1.5, sp); PLC_CHECK(a.velocity == 0.0);
     a.update(0, 1.0, sp); PLC_CHECK(a.velocity == 0.0);
 
     // Direction reversal goes through zero
-    a.velocity = sp.maxSpeed;
-    a.update(-1, 1.0, sp); PLC_CHECK(motionNear(a.velocity, 0.4));
+    a.velocity = vmax;
+    a.update(-1, 1.0, sp); PLC_CHECK(motionNear(a.velocity, vmax - dec));
     a.update(-1, 1.5, sp); PLC_CHECK(a.velocity == 0.0);
-    a.update(-1, 1.0, sp); PLC_CHECK(motionNear(a.velocity, -0.4));
-    a.velocity = sp.maxSpeed;
+    a.update(-1, 1.0, sp); PLC_CHECK(motionNear(a.velocity, -acc));
+    a.velocity = vmax;
     bool sawZero = false;
     for (int k = 0; k < 100; ++k) {
         a.update(-1, 0.13, sp);
         if (a.velocity == 0.0) sawZero = true;
         if (a.velocity < 0.0) PLC_CHECK(sawZero);
     }
-    PLC_CHECK(motionNear(a.velocity, -sp.maxSpeed));
+    PLC_CHECK(motionNear(a.velocity, -vmax));
 
     // Simultaneous opposite keys -> target 0
     PLC_CHECK(motionCommand(true, true) == 0);
     PLC_CHECK(motionCommand(false, false) == 0);
     PLC_CHECK(motionCommand(true, false) == 1);
     PLC_CHECK(motionCommand(false, true) == -1);
-    a.velocity = sp.maxSpeed;
-    a.update(motionCommand(true, true), 1.0, sp); PLC_CHECK(motionNear(a.velocity, 0.4));
+    a.velocity = vmax;
+    a.update(motionCommand(true, true), 1.0, sp); PLC_CHECK(motionNear(a.velocity, vmax - dec));
     AxisMotion z;
     z.update(motionCommand(true, true), 1.0, sp); PLC_CHECK(z.velocity == 0.0);
 
@@ -391,7 +416,8 @@ inline void testRestrictions() {
     const double slewSlow = 0.25 * kSlewMotion.maxSpeed;
     MotionState w; w.reset(0.0, 0.0, 0.0, 0.0);
     w.slew.velocity = kSlewMotion.maxSpeed;
-    w.update(1, 0, 0.05, L); PLC_CHECK(motionNear(w.slew.velocity, kSlewMotion.maxSpeed - 0.02));
+    w.update(1, 0, 0.05, L);
+    PLC_CHECK(motionNear(w.slew.velocity, kSlewMotion.maxSpeed - kSlewMotion.deceleration * 0.05));
     for (int k = 0; k < 30; ++k) { w.update(1, 0, 0.13, L); PLC_CHECK(w.slew.velocity >= slewSlow - 1e-12); }
     PLC_CHECK(motionNear(w.slew.velocity, slewSlow));
 
@@ -400,7 +426,7 @@ inline void testRestrictions() {
     L = decodeAcsRestrictions(f);
     MotionState o; o.reset(0.0, 0.0, 0.0, 0.0);
     for (int k = 0; k < 10; ++k) { o.update(1, 0, 0.13, L); PLC_CHECK(o.slew.velocity == 0.0); }
-    o.update(-1, 0, 0.25, L); PLC_CHECK(motionNear(o.slew.velocity, -0.1));
+    o.update(-1, 0, 0.25, L); PLC_CHECK(motionNear(o.slew.velocity, -kSlewMotion.acceleration * 0.25));
     for (int k = 0; k < 50; ++k) o.update(-1, 0, 0.13, L);
     PLC_CHECK(motionNear(o.slew.velocity, -kSlewMotion.maxSpeed));
 
@@ -420,6 +446,7 @@ inline void testRestrictions() {
     for (int k = 0; k < 100; ++k) t.update(0, 1, 0.13, L);
     PLC_CHECK(motionNear(t.trolley.velocity, vt));
 }
+
 inline int runSelfTests() {
     g_testFailures = 0;
     testValuePacking();
@@ -428,11 +455,11 @@ inline int runSelfTests() {
     testProgression();
     testTxLogDecodesFrame();
     testEngToRaw();
+    testSpeedScaling();
     testMotion();
     testRestrictions();
     if (g_testFailures == 0) std::printf("SELFTEST PASSED\n");
     else std::printf("SELFTEST FAILED: %d check(s)\n", g_testFailures);
     return g_testFailures == 0 ? 0 : 1;
 }
-
 } // namespace plc105
